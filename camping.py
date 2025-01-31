@@ -48,6 +48,12 @@ def get_park_information(
 
     Notably, the output doesn't tell you which sites are available. The rest of
     the script doesn't need to know this to determine whether sites are available.
+
+    *** UPDATE ***
+    Enhanced version that now includes campsite names in the return data.
+    Returns a tuple of (availability_data, campsite_metadata) where:
+    - availability_data is the same format as before: {"<campsite_id>": [<date>, <date>]}
+    - campsite_metadata is a dict: {"<campsite_id>": {"name": "<name>", "type": "<type>"}}
     """
 
     # Get each first of the month for months in the range we care about.
@@ -56,44 +62,42 @@ def get_park_information(
         rrule.rrule(rrule.MONTHLY, dtstart=start_of_month, until=end_date)
     )
 
-    # Get data for each month.
     api_data = []
     for month_date in months:
         api_data.append(RecreationClient.get_availability(park_id, month_date))
 
-    # Collapse the data into the described output format.
-    # Filter by campsite_type if necessary.
     data = {}
+    campsite_metadata = {}
 
     for month_data in api_data:
         for campsite_id, campsite_data in month_data["campsites"].items():
             if campsite_id in excluded_site_ids:
                 continue
+                
+            # Store metadata for this campsite
+            campsite_metadata[campsite_id] = {
+                "name": campsite_data.get("site", f"Site {campsite_id}"),  # Fallback if name not available
+                "type": campsite_data.get("campsite_type", "Unknown")
+            }
+            
             available = []
             a = data.setdefault(campsite_id, [])
-            for date, availability_value in campsite_data[
-                "availabilities"
-            ].items():
+            for date, availability_value in campsite_data["availabilities"].items():
                 if availability_value != "Available":
                     continue
 
-                if (
-                    campsite_type
-                    and campsite_type != campsite_data["campsite_type"]
-                ):
+                if campsite_type and campsite_type != campsite_data["campsite_type"]:
                     continue
 
-                if (
-                    len(campsite_ids) > 0
-                    and int(campsite_data["campsite_id"]) not in campsite_ids
-                ):
+                if len(campsite_ids) > 0 and int(campsite_data["campsite_id"]) not in campsite_ids:
                     continue
 
                 available.append(date)
             if available:
                 a += available
 
-    return data
+    return data, campsite_metadata
+
 
 def is_weekend(date):
     weekday = date.weekday()
@@ -102,8 +106,9 @@ def is_weekend(date):
 
 
 def get_num_available_sites(
-    park_information, start_date, end_date, nights=None, weekends_only=False,
+    park_information, campsite_metadata, start_date, end_date, nights=None, weekends_only=False,
 ):
+    """Modified to accept campsite_metadata parameter"""
     maximum = len(park_information)
 
     num_available = 0
@@ -122,9 +127,8 @@ def get_num_available_sites(
         nights = num_days
         LOG.debug("Setting number of nights to {}.".format(nights))
 
-    available_dates_by_campsite_id = defaultdict(list)
+    available_dates_by_campsite = defaultdict(list)
     for site, availabilities in park_information.items():
-        # List of dates that are in the desired range for this site.
         desired_available = []
 
         for date in availabilities:
@@ -145,11 +149,15 @@ def get_num_available_sites(
 
         for r in appropriate_consecutive_ranges:
             start, end = r
-            available_dates_by_campsite_id[int(site)].append(
-                {"start": start, "end": end}
-            )
+            site_id = int(site)
+            available_dates_by_campsite[site_id].append({
+                "start": start,
+                "end": end,
+                "name": campsite_metadata[site]["name"],
+                "type": campsite_metadata[site]["type"]
+            })
 
-    return num_available, maximum, available_dates_by_campsite_id
+    return num_available, maximum, available_dates_by_campsite
 
 
 def consecutive_nights(available, nights):
@@ -194,7 +202,7 @@ def consecutive_nights(available, nights):
 def check_park(
     park_id, start_date, end_date, campsite_type, campsite_ids=(), nights=None, weekends_only=False, excluded_site_ids=[],
 ):
-    park_information = get_park_information(
+    park_information, campsite_metadata = get_park_information(
         park_id, start_date, end_date, campsite_type, campsite_ids, excluded_site_ids=excluded_site_ids,
     )
     LOG.debug(
@@ -204,7 +212,7 @@ def check_park(
     )
     park_name = RecreationClient.get_park_name(park_id)
     current, maximum, availabilities_filtered = get_num_available_sites(
-        park_information, start_date, end_date, nights=nights, weekends_only=weekends_only,
+        park_information, campsite_metadata, start_date, end_date, nights=nights, weekends_only=weekends_only,
     )
     return current, maximum, availabilities_filtered, park_name
 
@@ -215,7 +223,7 @@ def generate_human_output(
     out = []
     has_availabilities = False
     for park_id, info in info_by_park_id.items():
-        current, maximum, available_dates_by_site_id, park_name = info
+        current, maximum, available_dates_by_site, park_name = info
         if current:
             emoji = Emoji.SUCCESS.value
             has_availabilities = True
@@ -232,12 +240,15 @@ def generate_human_output(
             )
         )
 
-        # Displays campsite ID and availability dates.
-        if gen_campsite_info and available_dates_by_site_id:
-            for site_id, dates in available_dates_by_site_id.items():
+        # Enhanced output with campsite names
+        if gen_campsite_info and available_dates_by_site:
+            for site_id, dates in available_dates_by_site.items():
+                first_date = dates[0]  # All dates for same site will have same name/type
                 out.append(
-                    "  * Site {site_id} is available on the following dates:".format(
-                        site_id=site_id
+                    "  * {name} (Site {site_id}, Type: {type}) dates available:".format(
+                        name=first_date["name"],
+                        site_id=site_id,
+                        type=first_date["type"]
                     )
                 )
                 for date in dates:
@@ -250,7 +261,7 @@ def generate_human_output(
     if has_availabilities:
         out.insert(
             0,
-            "there are campsites available from {start} to {end}!!!".format(
+            "There are campsites available from {start} to {end}!!!".format(
                 start=start_date.strftime(DateFormat.INPUT_DATE_FORMAT.value),
                 end=end_date.strftime(DateFormat.INPUT_DATE_FORMAT.value),
             ),
